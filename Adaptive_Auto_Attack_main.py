@@ -19,10 +19,16 @@ import math
 import random
 import time
 
-# settings
 device = torch.device("cuda")
 
 class ImageSet(Dataset):
+    """Dataset wrapper around a dataframe of image paths + labels.
+
+    Args:
+        df: dataframe w/ img_path, label, not_suc, need_atk columns
+        transformer: torchvision transform pipeline
+        datasets: dataset name string (mnist handled separately for grayscale)
+    """
     def __init__(self, df, transformer,datasets):
         self.df = df
         self.transformer = transformer
@@ -34,6 +40,7 @@ class ImageSet(Dataset):
         if self.datasets!="mnist":
             image = self.transformer(Image.open(image_path).convert('RGB'))
         else:
+            # mnist is single channel, no rgb convert
             image = self.transformer(Image.open(image_path))
         label_idx = self.df.iloc[item]['label']
         suc = self.df.iloc[item]['not_suc']
@@ -47,9 +54,21 @@ class ImageSet(Dataset):
         return sample
 
 def mytest_loader( batch_size,dataframe,datasets,model_name='None'):
+    """Build dataloader w/ dataset-specific transforms.
+
+    Args:
+        batch_size: batch size
+        dataframe: input df for ImageSet
+        datasets: dataset name (imagenet/cifar/mnist)
+        model_name: special-case for FBTF_Imagenet which needs 288 crop
+
+    Returns:
+        DataLoader for the test set
+    """
     if datasets=="imagenet":
         transformer = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(224),transforms.ToTensor()])
         if model_name=="FBTF_Imagenet":
+            # fbtf uses bigger crop
             transformer = transforms.Compose(
                 [transforms.CenterCrop(288), transforms.ToTensor()])
     else:
@@ -62,11 +81,22 @@ def mytest_loader( batch_size,dataframe,datasets,model_name='None'):
                              pin_memory=True)
     return dataloaders
 
-# margin loss
 def margin_loss(logits,y,i=0,MT=True):
+    """Margin loss between true class logit and a target class logit.
+
+    Args:
+        logits: model outputs [bs, num_class]
+        y: true labels
+        i: which top-k target to use when MT=True
+        MT: multi-target mode, picks i-th highest non-true logit
+
+    Returns:
+        per-sample margin loss (target - true)
+    """
     bs = len(y)
     Y = y.view(-1,1)
     logit_org = logits.gather(1,Y)
+    # mask out true class so it can't be picked as target
     T = torch.eye(logits.shape[1])[y].to(device) * 999999
     TA = (logits-T)
     LTA = TA.argmax(1,keepdim=True)
@@ -80,6 +110,14 @@ def margin_loss(logits,y,i=0,MT=True):
     return loss
 
 def normalize_x(x):
+    """Normalize tensor per-sample by its Linf or L2 norm.
+
+    Args:
+        x: input tensor [bs, ...]
+
+    Returns:
+        x normalized along non-batch dims
+    """
     norm='L2'
     orig_dim = list(x.shape[1:])
     ndims = len(orig_dim)
@@ -91,6 +129,14 @@ def normalize_x(x):
         return x / (t.view(-1, *([1] * ndims)) + 1e-12)
 
 def lp_norm(x):
+    """Compute per-sample L2 norm.
+
+    Args:
+        x: input tensor [bs, ...]
+
+    Returns:
+        norm tensor shaped for broadcasting back to x
+    """
     norm ='L2'
     orig_dim = list(x.shape[1:])
     ndims = len(orig_dim)
@@ -102,8 +148,44 @@ def AAA_white_box(model, X, X_adv, y, epsilon=0.031, step_num=20, ADI_step_num=8
                   warm = False, bias_ODI=False, random_start = True, w_logit_dir=None, c_logit_dir=None,
                   sorted_logits=None, No_class = None, data_set = None, BIAS_ATK= None,
                   final_bias_ODI = False, No_epoch = 0, num_class=10, MT=False, Lnorm='Linf', out_re=None):
-    tbn = 0 # number of  backward propagation
-    tfn = 0 # number of  forward propagation
+    """Single white-box attack run: ADI warmup phase + PGD-style attack phase.
+
+    Args:
+        model: target model
+        X: clean inputs
+        X_adv: starting adv inputs (used if warm=True)
+        y: true labels
+        epsilon: perturbation budget
+        step_num: pgd iterations
+        ADI_step_num: output diversified initialization steps
+        warm: continue from existing X_adv vs reset to X
+        bias_ODI: bias the ODI direction toward specific wrong classes
+        random_start: add random noise to start
+        w_logit_dir / c_logit_dir: aggregated wrong/correct logit direction stats
+        sorted_logits: per-sample logit ranking from a previous forward pass
+        No_class: rotates which target class gets biased
+        data_set: dataset name (controls threshold_class etc)
+        BIAS_ATK: hard-bias mode flag
+        final_bias_ODI: late-stage stronger bias config
+        No_epoch: which restart we're on (used by MT)
+        num_class: number of classes
+        MT: multi-target margin loss
+        Lnorm: 'Linf' or 'L2'
+        out_re: outer restart counter
+
+    Returns:
+        atk_acc_num: how many still classified correctly
+        np_atk_filed_index: bool array of which samples still un-attacked
+        X_adv: final adv examples
+        each_max_loss: best loss seen per sample
+        odi_atk_suc_num: samples broken during ODI phase alone
+        each_back_num: total backward pass count
+        total_odi_distribution: tracked ODI direction stats per atk class
+        tfn: forward pass count
+    """
+    tbn = 0
+    tfn = 0
+    # threshold_class controls how many of top logits we cycle through as targets
     if data_set=='mnist':
         threshold_class=9
     if data_set=="cifar10":
@@ -119,6 +201,7 @@ def AAA_white_box(model, X, X_adv, y, epsilon=0.031, step_num=20, ADI_step_num=8
         X_adv = X_adv.data + random_noise
         X_adv = torch.clamp(X_adv, 0, 1.0)
         if warm:
+            # if warm starting, project back into eps ball around X
             eta = torch.clamp(X_adv.data - X.data, -epsilon, epsilon)
             X_adv = X.data + eta
             X_adv = torch.clamp(X_adv, 0, 1.0)
@@ -130,13 +213,16 @@ def AAA_white_box(model, X, X_adv, y, epsilon=0.031, step_num=20, ADI_step_num=8
     odi_atk_suc_num = 0
     each_back_num = 0
 
+    # random direction for ODI
     randVector_ = torch.FloatTensor(X_adv.shape[0],num_class).uniform_(-1.0, 1.0).to(device)
     if bias_ODI and out_re>1:
         if BIAS_ATK:
+            # push true class down, push the no_r-th ranked class up
             randVector_[np.arange(X_adv.shape[0]), y] = (num_class/10)*random.uniform(-0.1,0.5)
             no_r = -2 - No_class % threshold_class
             randVector_[np.arange(X_adv.shape[0]), sorted_logits[:, no_r]] = (num_class/10)*0.8
         else:
+            # pick bias signs based on direction stats from earlier rounds
             if w_logit_dir>0 and c_logit_dir>0:
                 randVector_[np.arange(X_adv.shape[0]), y] = (num_class / 10) * random.uniform(-0.1, 0.5)
                 no_r = -2 - No_class % threshold_class
@@ -153,11 +239,13 @@ def AAA_white_box(model, X, X_adv, y, epsilon=0.031, step_num=20, ADI_step_num=8
                 randVector_[np.arange(X_adv.shape[0]), y] = (num_class / 10) * random.uniform(-0.5, 0.1)
                 no_r = -2 - No_class % threshold_class
                 randVector_[np.arange(X_adv.shape[0]), sorted_logits[:, no_r]] = (num_class / 10) * 0.8
+            # imagenet/cifar100 always use this config
             if data_set == "imagenet" or data_set == "cifar100":
                 randVector_[np.arange(X_adv.shape[0]), y] = (num_class / 10) * random.uniform(-0.5, 0.1)
                 no_r = -2 - No_class % threshold_class
                 randVector_[np.arange(X_adv.shape[0]), sorted_logits[:, no_r]] = (num_class / 10) * 0.8
         if final_bias_ODI:
+            # final stage: stronger bias, smaller threshold pool
             if BIAS_ATK:
                 randVector_[np.arange(X_adv.shape[0]), y] = 0.0
                 no_r = -2 - No_class % threshold_class
@@ -181,6 +269,7 @@ def AAA_white_box(model, X, X_adv, y, epsilon=0.031, step_num=20, ADI_step_num=8
     tran_T2F=True
     when_atk_suc_iter_num = []
     for i in range(ADI_step_num + step_num):
+        # only operate on samples not yet broken
         X_adv_f = X_adv[atk_filed_index,:,:,:]
         X_f = X[atk_filed_index,:,:,:]
         y_f = y[atk_filed_index]
@@ -190,10 +279,12 @@ def AAA_white_box(model, X, X_adv, y, epsilon=0.031, step_num=20, ADI_step_num=8
         opt.zero_grad()
         with torch.enable_grad():
             if i< ADI_step_num:
+                # ODI phase: maximize random direction dot product
                 randVector_odi = randVector_[atk_filed_index, :]
                 loss = (model(X_adv_f) * randVector_odi).sum()
                 tfn+=X_adv_f.shape[0]
             else:
+                # main attack phase: margin loss
                 if MT:
                     loss = margin_loss(model(X_adv_f), y[atk_filed_index],No_epoch,MT=MT).sum()
                 else:
@@ -202,11 +293,13 @@ def AAA_white_box(model, X, X_adv, y, epsilon=0.031, step_num=20, ADI_step_num=8
         loss.backward()
         tbn+=X_adv_f.shape[0]
         if i<ADI_step_num:
+            # full eps step during ODI
             if Lnorm =="Linf":
                 eta = epsilon * X_adv_f.grad.data.sign()
             elif Lnorm=="L2":
                 eta = epsilon * normalize_x(X_adv_f.grad.data)
         else:
+            # cosine-decayed step size during attack phase
             max_ssize = epsilon
             if Lnorm=='Linf':
                 if step_num <=10:
@@ -225,6 +318,7 @@ def AAA_white_box(model, X, X_adv, y, epsilon=0.031, step_num=20, ADI_step_num=8
             elif Lnorm == "L2":
                 eta = step_size * normalize_x(X_adv_f.grad.data)
         X_adv_f = X_adv_f.data + eta
+        # project back into eps ball + valid pixel range
         if Lnorm == 'Linf':
             eta = torch.clamp(X_adv_f.data - X_f.data, -epsilon, epsilon)
             X_adv_f = X_f.data + eta
@@ -236,16 +330,18 @@ def AAA_white_box(model, X, X_adv, y, epsilon=0.031, step_num=20, ADI_step_num=8
         output_ = model(X_adv_f)
         tfn+=X_adv_f.shape[0]
         output_loss = margin_loss(output_,y_f).squeeze()
+        # track best loss seen per sample
         each_max_loss[np_atk_filed_index] = np.where(each_max_loss[np_atk_filed_index]>output_loss.detach().cpu().numpy(),
                                                      each_max_loss[np_atk_filed_index],output_loss.detach().cpu().numpy())
         X_adv[atk_filed_index,:,:,:]= X_adv_f
         _f_index = (output_.data.max(1)[1] == y_f.data)
 
         if out_re>=1:
+            # log which ODI directions led to breaks, by target class rank
             predict_wrong_num = int((~_f_index).float().sum().detach().cpu())
-            # print(predict_wrong_num,out_re)
             if predict_wrong_num>0 and ADI_step_num>0:
                 if tran_T2F:
+                    # only need to compute sort_np_rand once per call
                     tran_T2F = False
                     np_randVector_ = randVector_.detach().cpu().numpy().copy()
                     sort_np_rand = np_randVector_.copy()
@@ -264,6 +360,7 @@ def AAA_white_box(model, X, X_adv, y, epsilon=0.031, step_num=20, ADI_step_num=8
         atk_filed_index[atk_filed_index.clone()]=_f_index
         np_atk_filed_index = atk_filed_index.detach().cpu().numpy()
         if ADI_step_num > 0 and i==ADI_step_num-1:
+            # snapshot break count right after ODI phase
             odi_atk_suc_num = atk_filed_index.shape[0] - atk_filed_index.float().sum()
     atk_acc_num = (model(X_adv).data.max(1)[1] == y.data).float().sum()
     tfn+=X_adv.shape[0]
@@ -272,7 +369,20 @@ def AAA_white_box(model, X, X_adv, y, epsilon=0.031, step_num=20, ADI_step_num=8
 
 def Adaptive_Auto_white_box_attack(model, device, eps, is_random, batch_size, average_num, model_name, data_set="cifar10",
                                    Lnorm='Linf'):
-    ####  1.Loading datasets  ####
+    """Top-level adaptive attack loop. Iterates outer restarts, adapts hyperparams based on success rate.
+
+    Args:
+        model: target model in eval mode
+        device: cuda device
+        eps: perturbation budget
+        is_random: random start flag
+        batch_size: batch size
+        average_num: budget multiplier (forward/backward pass budget = N * average_num)
+        model_name: for logging
+        data_set: 'mnist'/'cifar10'/'cifar100'/'imagenet'
+        Lnorm: 'Linf' or 'L2'
+    """
+    # 1. load dataset based on which one we're attacking
     if data_set=="mnist":
         num_class=10
         dataset_dir = 'data/mnist_test'
@@ -294,7 +404,8 @@ def Adaptive_Auto_white_box_attack(model, device, eps, is_random, batch_size, av
     init_atk = pd.DataFrame({'img_path':all_atk_imgs,'label':all_atk_labs,'not_suc':not_suc_index,'need_atk':not_suc_index})
     data_loader = mytest_loader(batch_size=batch_size, dataframe=init_atk,datasets=data_set,model_name=model_name)
     total_odi_distribution = np.zeros((num_class,num_class+1))
-    # 2.Initializing hyperparameters
+
+    # 2. init bookkeeping
     acc_curve = []
     robust_acc_oneshot = 0
     used_backward_num = 0
@@ -309,6 +420,7 @@ def Adaptive_Auto_white_box_attack(model, device, eps, is_random, batch_size, av
     No_epoch = -2
     total_bn = 0
     total_fn = 0
+    # initial pass: filter out already-misclassified + grab logit rankings
     for i, test_data in enumerate(data_loader):
         bstart = i * batch_size
         bend = min((i + 1) * batch_size, len(not_suc_index))
@@ -319,6 +431,7 @@ def Adaptive_Auto_white_box_attack(model, device, eps, is_random, batch_size, av
         clean_filed_index = (out_clean.data.max(1)[1] == y.data).detach().cpu().numpy()
         natural_acc += acc_clean_num
         not_suc_index[bstart:bend] = not_suc_index[bstart:bend] * clean_filed_index
+        # quick noise check, knock out trivially fragile samples
         if Lnorm =='Linf':
             random_noise = eps * torch.FloatTensor(*X.shape).uniform_(-eps, eps).sign().to(device)
             X_adv = X.data + random_noise
@@ -348,6 +461,7 @@ def Adaptive_Auto_white_box_attack(model, device, eps, is_random, batch_size, av
         alpha = 1
 
         if out_re ==0:
+            # round 0: no ODI, plain pgd warmup
             adi_iter_num = 0
             max_iter = 8
         else:
@@ -356,13 +470,14 @@ def Adaptive_Auto_white_box_attack(model, device, eps, is_random, batch_size, av
         if out_re==1:
             restart_1_need_atk_num = robust_acc_oneshot
         if out_re==2:
+            # check ODI direction stats to pick BIAS_ATK mode for later rounds
             for i in range(1, num_class):
                 wrong_logits_direct += total_odi_distribution[i,num_class-i-1]
                 correct_logits_direct += total_odi_distribution[i,num_class-1]
-            # print(total_odi_distribution)
             print(f"{model_name} ##################### wrong_dire:{wrong_logits_direct:0.4} "
                   f"correct_dire:{correct_logits_direct:0.4} ###################")
         if out_re >2:
+            # branch: ODI not making progress -> longer attacks, no bias
             if total_adi_atk_suc_num<0.05 * restart_1_need_atk_num:
                 BIAS_ATK = False
                 if out_re>2:
@@ -390,6 +505,7 @@ def Adaptive_Auto_white_box_attack(model, device, eps, is_random, batch_size, av
                     restart_num = 50
                     if data_set=='imagenet':
                         restart_num=31
+            # branch: ODI working -> use biased attacks w/ many restarts
             else:
                 BIAS_ATK = True
                 if out_re>2:
@@ -422,6 +538,7 @@ def Adaptive_Auto_white_box_attack(model, device, eps, is_random, batch_size, av
                 if out_re > 11:
                     alpha, max_iter, adi_iter_num = 0.5, 45, 10
                     restart_num = 20
+        # alpha floor + dataset specific tweaks
         if data_set=="mnist":
             alpha=max(alpha,0.03)
         if data_set=="cifar10":
@@ -432,6 +549,7 @@ def Adaptive_Auto_white_box_attack(model, device, eps, is_random, batch_size, av
             alpha = max(alpha,0.03)
             max_iter =max_iter+10
             restart_num+=1
+        # few samples left, just hammer them all
         if int(not_suc_index.sum())<len(not_suc_index)*0.1:
             alpha =1.0;restart_num +=10
         for r in range(restart_num):
@@ -441,6 +559,7 @@ def Adaptive_Auto_white_box_attack(model, device, eps, is_random, batch_size, av
             remaining_iterations = total_iter_num - used_backward_num
 
             now_not_suc_num = int(not_suc_index.sum())
+            # pick top alpha-fraction of remaining samples by max_loss
             need_atk_num_place1 = (len(not_suc_index)-now_not_suc_num)+min(max(100,int(now_not_suc_num*alpha)),now_not_suc_num)
 
             max_K = np.partition(max_loss, -need_atk_num_place1)[-need_atk_num_place1]
@@ -454,11 +573,13 @@ def Adaptive_Auto_white_box_attack(model, device, eps, is_random, batch_size, av
             now_need_atk_index = np.ones(now_need_atk_num)
             now_max_loss = max_loss[not_suc_need_atk_index]
             data_loader = mytest_loader(batch_size=batch_size, dataframe=fast_init_atk,datasets=data_set,model_name=model_name)
+            # late rounds use stronger ODI bias
             if (out_re<10 and BIAS_ATK==False) or(out_re<11 and BIAS_ATK==True):
                 final_odi_atk = False
             else:
                 final_odi_atk = True
             No_class = No_epoch
+            # divvy remaining budget across remaining restarts
             iter_num = int(remaining_iterations/(restart_num*(out_restart_num-out_re))* now_need_atk_num)
             iter_num = min(max(iter_num,15),(max_iter+adi_iter_num))
 
@@ -500,6 +621,12 @@ def Adaptive_Auto_white_box_attack(model, device, eps, is_random, batch_size, av
             print(acc_curve)
 
 class Normalize(nn.Module):
+    """Per-channel input normalization wrapped as a module so it lives in the model graph.
+
+    Args:
+        mean: per-channel means
+        std: per-channel stds
+    """
     def __init__(self, mean, std):
         super(Normalize, self).__init__()
         self.mean = mean
@@ -510,8 +637,16 @@ class Normalize(nn.Module):
         for i in range(size[1]):
             x[:,i] = (x[:,i] - self.mean[i])/self.std[i]
         return x
-# AWP
+
 def filter_state_dict(state_dict):
+    """Strip 'module.' prefix and skip sub_block keys for AWP checkpoints.
+
+    Args:
+        state_dict: raw checkpoint dict
+
+    Returns:
+        cleaned OrderedDict ready for load_state_dict
+    """
     from collections import OrderedDict
 
     if 'state_dict' in state_dict.keys():
@@ -527,6 +662,14 @@ def filter_state_dict(state_dict):
     return new_state_dict
 
 def level_sets_filter_state_dict(state_dict):
+    """Same idea as filter_state_dict but strips 'model.model.' prefix for level sets ckpts.
+
+    Args:
+        state_dict: raw checkpoint dict
+
+    Returns:
+        cleaned OrderedDict
+    """
     from collections import OrderedDict
     if 'model_state_dict' in state_dict.keys():
         state_dict = state_dict['model_state_dict']
@@ -541,20 +684,33 @@ def level_sets_filter_state_dict(state_dict):
     return new_state_dict
 
 def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=100):
+    """Loads a named pretrained model + runs Adaptive_Auto_white_box_attack on it.
 
+    Big if-else over model_name handles all the per-model loading quirks
+    (architecture, checkpoint format, normalization, eps/dataset overrides).
+
+    Args:
+        flag: log tag
+        model_name: which model to load (see if-chain below)
+        ep: perturbation budget, often overridden per-model
+        random: random start flag
+        batch_size: default batch size, often overridden per-model
+        average_number: budget multiplier passed to the attack
+    """
     stime = datetime.datetime.now()
     print(f"{flag} {model_name}")
     data_set="cifar10"
     Lnorm="Linf"
     if model_name=="TRADES":
-        from models.CIFAR10.TRADES_WRN import WideResNet # TRADES_WRN
+        from models.CIFAR10.TRADES_WRN import WideResNet
         ep = 0.031
         model = WideResNet().to(device)
         model.load_state_dict(torch.load("model_weights/TRADES/TRADES_WRN.pt"))
     if model_name =="MART":
         from models.CIFAR10.MART_WRN import WideResNet
         model = WideResNet(depth=28).to(device)
-        model = nn.DataParallel(model) # if widresnet_mart,we should use this line
+        # mart wrn ckpt was saved w/ DataParallel wrapper
+        model = nn.DataParallel(model)
         model.load_state_dict(torch.load("model_weights/MART/MART_UWRN.pt")['state_dict'])
 
     if model_name=="Feature_Scatter":
@@ -589,8 +745,6 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
     if model_name=="fbtf":
         from models.CIFAR10.FBTF.preact_resnet import PreActResNet18
         model = PreActResNet18().to("cuda")
-        # model = nn.DataParallel(model)
-        # model.load_state_dict(torch.load("model_weights/FBTF/cifar_model_weights_30_epochs.pth"),strict=False)
         model.load_state_dict(torch.load("model_weights/FBTF/Wong2020Fast.pt"),strict=False)
         model = nn.Sequential(Normalize([0.4914, 0.4822, 0.4465], [0.2471, 0.2435, 0.2616]), model)
 
@@ -621,13 +775,10 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
         model.load_state_dict(ckpt)
 
     if model_name=="mma":
-        # from models.CIFAR10.MMA.MMA import WideResNet
-        # model = WideResNet(depth=28, widen_factor=4, sub_block1=False).to("cuda")
         from models.CIFAR10.MMA.MMA import Ding2020MMANet
         model = Ding2020MMANet().to("cuda")
         ckpt = torch.load("model_weights/MMA/Ding2020MMA.pt")
         model.load_state_dict(ckpt)
-        # model = nn.Sequential(Normalize([0.4914, 0.4822, 0.4465], [0.2471, 0.2435, 0.2616]), model)
 
     if model_name=="overfit":
         from models.CIFAR10.OVERFIT.robust_overfitting import WideResNet
@@ -640,6 +791,7 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
         from models.CIFAR10.PRE_TRAIN.pre_training import WideResNet
         model = WideResNet(depth=28, num_classes=10, widen_factor=10).to("cuda")
         model = nn.DataParallel(model)
+        # swap final fc to 10-class head
         model.module.fc = nn.Linear(640, 10)
         model.load_state_dict(torch.load("model_weights/PRE_TRAIN/cifar10wrn_baseline_epoch_4.pt"))
         model = nn.Sequential(Normalize([0.5, 0.5, 0.5], [0.50, 0.50, 0.50]), model)
@@ -703,6 +855,7 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
             activation_fn=widresnet.Swish, mean=widresnet.CIFAR10_MEAN,
             std=widresnet.CIFAR10_STD)
         model.load_state_dict(torch.load("model_weights/FIX_DATA/Gowal2020Uncovering_70_16_extra.pt"))
+        # bigger model, smaller batch
         batch_size=32
 
     if model_name=="ULAT_34_20":
@@ -745,24 +898,24 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
         batch_size=32
 
     if model_name=="IAR":
-        from models.CIFAR10.TRADES_WRN import WideResNet # TRADES_WRN
+        from models.CIFAR10.TRADES_WRN import WideResNet
         model = WideResNet().to(device)
         model.load_state_dict(torch.load("model_weights/IAR/cifar10_wrn.pt"))
 
     if model_name=="LBGAT_34_10":
-        from models.CIFAR10.TRADES_WRN import WideResNet # TRADES_WRN
+        from models.CIFAR10.TRADES_WRN import WideResNet
         ep = 0.031
         model = WideResNet().to(device)
         model.load_state_dict(torch.load("model_weights/LBGAT/cifar10_lbgat0_wideresnet34-10.pt"))
 
     if model_name=="LBGAT_34_20":
-        from models.CIFAR10.TRADES_WRN import WideResNet # TRADES_WRN
+        from models.CIFAR10.TRADES_WRN import WideResNet
         ep = 0.031
         model = WideResNet(widen_factor=20).to(device)
         model.load_state_dict(torch.load("model_weights/LBGAT/cifar10_lbgat0_wideresnet34-20.pt"))
 
     if model_name=="FAT":
-        from models.CIFAR10.TRADES_WRN import WideResNet # TRADES_WRN
+        from models.CIFAR10.TRADES_WRN import WideResNet
         model = WideResNet().to(device)
         model = torch.nn.DataParallel(model)
         model.load_state_dict(torch.load("model_weights/FAT/fat_for_trades_wrn34-10_eps0.062_beta6.0.pth.tar")["state_dict"])
@@ -770,7 +923,6 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
     if model_name=="proxy_dist_r18":
         from models.CIFAR10.PROXY_DIST.resnet import ResNet18
         model = ResNet18().to("cuda")
-        # model = torch.nn.DataParallel(model)
         ckpt = (torch.load("model_weights/PROXY_DIST/Sehwag2021Proxy_R18.pt"))
         model.load_state_dict(ckpt)
     if model_name=="TRPF":
@@ -782,7 +934,6 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
         model = torch.nn.Sequential(
             Normalize_layer(mean, std),
             model)
-        # model = torch.nn.DataParallel(model)
         ckpt = (torch.load("model_weights/TRPF/resnet18_cifar10_dens0.05_magnitude_epoch200_testAcc_87.31999969482422.pt"))
         model.load_state_dict(ckpt)
 
@@ -793,7 +944,7 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
         model.load_state_dict(torch.load("model_weights/TAARB/OAAT_CIFAR10_RN18.pt"))
 
     if model_name=="OAAT_wrn34":
-        from models.CIFAR10.OAAT.widresnet import WideResNet # TRADES_WRN
+        from models.CIFAR10.OAAT.widresnet import WideResNet
         model = WideResNet(num_classes=10).to("cuda")
         model = torch.nn.DataParallel(model)
         model.load_state_dict(torch.load("model_weights/TAARB/OAAT_CIFAR10_WRN34.pt"))
@@ -810,6 +961,7 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
         model = nn.DataParallel(model)
         model.load_state_dict(torch.load("model_weights/RLPE/Wide-RST_0.1485.pt")["state_dict"])
 
+    # cifar100 variants below
     if model_name=="ULAT_70_16_with_100":
         data_set = "cifar100"
         from models.CIFAR10.FIX_DATA import widresnet
@@ -862,21 +1014,21 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
 
     if model_name=="OAAT_wrn34_100":
         data_set = "cifar100"
-        from models.CIFAR10.OAAT.widresnet import WideResNet # TRADES_WRN
+        from models.CIFAR10.OAAT.widresnet import WideResNet
         model = WideResNet(num_classes=100).to("cuda")
         model = torch.nn.DataParallel(model)
         model.load_state_dict(torch.load("model_weights/TAARB/OAAT_CIFAR100_WRN34.pkl"))
 
     if model_name=="LBGAT_34_10_100":
         data_set = "cifar100"
-        from models.CIFAR10.TRADES_WRN import WideResNet # TRADES_WRN
+        from models.CIFAR10.TRADES_WRN import WideResNet
         ep = 0.031
         model = WideResNet(num_classes=100).to(device)
         model.load_state_dict(torch.load("model_weights/LBGAT/cifar100_lbgat6_wideresnet34-10.pt"))
 
     if model_name=="LBGAT_34_20_100":
         data_set = "cifar100"
-        from models.CIFAR10.TRADES_WRN import WideResNet # TRADES_WRN
+        from models.CIFAR10.TRADES_WRN import WideResNet
         ep = 0.031
         model = WideResNet(num_classes=100,widen_factor=20).to(device)
         model = torch.nn.DataParallel(model)
@@ -902,7 +1054,7 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
 
     if model_name=="IAR_100":
         data_set = "cifar100"
-        from models.CIFAR10.TRADES_WRN import WideResNet # TRADES_WRN
+        from models.CIFAR10.TRADES_WRN import WideResNet
         model = WideResNet(num_classes=100).to(device)
         model.load_state_dict(torch.load("model_weights/IAR/cifar100_wrn.pt"))
 
@@ -910,12 +1062,12 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
         data_set = "cifar100"
         from models.CIFAR10.OVERFIT.preactresnet import PreActResNet18
         model = PreActResNet18(num_classes=100)
-        # model = torch.nn.DataParallel(model)
         model.load_state_dict(torch.load("model_weights/OVERFIT/cifar100_linf_eps8.pth"))
         CIFAR100_MEAN = [0.5070751592371323, 0.48654887331495095, 0.4409178433670343]
         CIFAR100_STD = [0.2673342858792401, 0.2564384629170883, 0.27615047132568404]
         model = nn.Sequential(Normalize(CIFAR100_MEAN, CIFAR100_STD), model)
 
+    # imagenet linf models, eps=4/255
     if model_name =="Salman2020Do_R18":
         data_set = 'imagenet'
         ep=4/255
@@ -960,6 +1112,7 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
         model = nn.Sequential(Normalize(imagenet_mean, imagenet_std), model)
         batch_size=32
 
+    # L2 norm models below, eps=0.5 for cifar
     if model_name=="proxy_dist_L2":
         from models.CIFAR10.OVERFIT.robust_overfitting import WideResNet
         model = WideResNet(depth=34, num_classes=10, widen_factor=10)
@@ -1002,6 +1155,7 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
         batch_size=128
         ep=0.5
 
+    # imagenet L2 models, eps=3.0
     if model_name=="DARI_densenet_L2":
         data_set = 'imagenet'
         from robustness.model_utils import make_and_restore_model
@@ -1054,6 +1208,7 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
         batch_size = 16
         ep = 3.0
 
+    # mnist linf, eps=0.3
     if model_name=="TRADES_mnist":
         data_set='mnist'
         from models.mnist.small_cnn import SmallCNN
@@ -1066,6 +1221,7 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
         data_set='mnist'
         from models.CIFAR10.FIX_DATA import widresnet
         model_ctor = widresnet.WideResNet
+        # 1 input channel + padding=2 for mnist
         model = model_ctor(
             num_classes=10, depth=28, width=10,
             activation_fn=widresnet.Swish, mean=0.5,
@@ -1078,6 +1234,7 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
         data_set = 'imagenet'
         ep=4/255
         from torchvision import models as pt_models
+        # vanilla pretrained, no robustness training
         model = pt_models.resnet50(pretrained=True).to("cuda")
         imagenet_mean = (0.485, 0.456, 0.406)
         imagenet_std = (0.229, 0.224, 0.225)
@@ -1102,8 +1259,8 @@ def main(flag,model_name, ep=8./255,random=True, batch_size=128, average_number=
     print(f'use time:{etime-stime}s')
 
 if __name__ == '__main__':
-
-    # IAR,LBGAT_34_10,LBGAT_34_20,FAT,proxy_dist_r18,TRPF,OAAT_r18,OAAT_wrn34,RLPE_28_10,RLPE_34_15,ULAT_70_16_with_100
+    # uncomment whichever model you wanna run
+    # cifar10 batch 1: IAR,LBGAT_34_10,LBGAT_34_20,FAT,proxy_dist_r18,TRPF,OAAT_r18,OAAT_wrn34,RLPE_28_10,RLPE_34_15,ULAT_70_16_with_100
     # main('AAA',model_name="OAAT_r18", average_number=1000)
     # main('AAA',model_name="IAR", average_number=1000)
     # main('AAA',model_name="LBGAT_34_10", average_number=1000)
@@ -1115,7 +1272,7 @@ if __name__ == '__main__':
     # main('AAA',model_name="RLPE_28_10", average_number=1000)
     # main('AAA',model_name="RLPE_34_15", average_number=1000)
     # main('AAA',model_name="ULAT_70_16_with_100", average_number=1000)
-    # robustness,rst,self_adaptive,sensible,understanding_fast,yopo,ULAT_28_10_with,ULAT_70_16_extra,ULAT_34_20,ULAT_70_16,fix_data_28_10_with,fix_data_70_16_extra
+    # cifar10 batch 2: robustness,rst,self_adaptive,sensible,understanding_fast,yopo,ULAT_28_10_with,ULAT_70_16_extra,ULAT_34_20,ULAT_70_16,fix_data_28_10_with,fix_data_70_16_extra
     # main('AAA',model_name="robustness", average_number=1000)
     # main('AAA',model_name="rst", average_number=1000)
     # main('AAA',model_name="self_adaptive", average_number=1000)
@@ -1128,7 +1285,7 @@ if __name__ == '__main__':
     # main('AAA',model_name="ULAT_70_16", average_number=1000)
     # main('AAA',model_name="fix_data_28_10_with", average_number=1000)
     #main('AAA',model_name="fix_data_70_16_extra", average_number=1000)
-    # # ULAT_70_16_100,fix_data_28_10_with_100,fix_data_70_16_extra_100,OAAT_r18_100,OAAT_wrn34_100,LBGAT_34_10_100,LBGAT_34_20_100
+    # cifar100: ULAT_70_16_100,fix_data_28_10_with_100,fix_data_70_16_extra_100,OAAT_r18_100,OAAT_wrn34_100,LBGAT_34_10_100,LBGAT_34_20_100
     # main('AAA',model_name="ULAT_70_16_100", average_number=1000)
     # main('AAA',model_name="fix_data_28_10_with_100", average_number=1000)
     # main('AAA',model_name="fix_data_70_16_extra_100", average_number=1000)
@@ -1136,7 +1293,7 @@ if __name__ == '__main__':
     # main('AAA',model_name="OAAT_wrn34_100", average_number=1000)
     # main('AAA',model_name="LBGAT_34_10_100", average_number=1000)
     # main('AAA',model_name="LBGAT_34_20_100", average_number=1000)
-    # # TRADES,MART,Feature_Scatter,adv_inter,adv_regular,awp_28_10,awp_34_10,fbtf,geometry,hydra,hyer_embe,level_sets,mma,overfit,pre_train,proxy_dist
+    # cifar10 batch 3: TRADES,MART,Feature_Scatter,adv_inter,adv_regular,awp_28_10,awp_34_10,fbtf,geometry,hydra,hyer_embe,level_sets,mma,overfit,pre_train,proxy_dist
     # main('AAA',model_name="TRADES", average_number=500)
     # main('AAA',model_name="MART", average_number=1000)
     # main('AAA',model_name="Feature_Scatter", average_number=1000)
@@ -1153,7 +1310,7 @@ if __name__ == '__main__':
     # main('AAA',model_name="overfit", average_number=1000)
     # main('AAA',model_name="pre_train", average_number=1000)
     # main('AAA',model_name="proxy_dist", average_number=1000)
-    # awp_34_10_100,pre_train_28_10_100,IAR_100,overfit_100,Salman2020Do_R18,Salman2020Do_R50,Salman2020Do_50_2,FBTF_Imagenet
+    # cifar100 + imagenet: awp_34_10_100,pre_train_28_10_100,IAR_100,overfit_100,Salman2020Do_R18,Salman2020Do_R50,Salman2020Do_50_2,FBTF_Imagenet
     # main('AAA',model_name="awp_34_10_100", average_number=1000)
     # main('AAA',model_name="pre_train_28_10_100", average_number=1000)
     # main('AAA',model_name="IAR_100", average_number=1000)
@@ -1162,7 +1319,7 @@ if __name__ == '__main__':
     # main('AAA',model_name="Salman2020Do_R50", average_number=1000)
     #main('AAA',model_name="Salman2020Do_50_2", average_number=1000)
     #main('AAA',model_name="FBTF_Imagenet", average_number=1000)
-    # # proxy_dist_L2,overfit_R18_L2,fix_data_28_10_L2,robustness_L2,DARI_densenet_L2,DARI_VGG16_L2,DARI_ShuffleNet_L2
+    # L2 models: proxy_dist_L2,overfit_R18_L2,fix_data_28_10_L2,robustness_L2,DARI_densenet_L2,DARI_VGG16_L2,DARI_ShuffleNet_L2
     # main('AAA',model_name="proxy_dist_L2", average_number=1000)
     # main('AAA',model_name="overfit_R18_L2", average_number=1000)
     # main('AAA',model_name="fix_data_28_10_L2", average_number=1000)
@@ -1170,11 +1327,9 @@ if __name__ == '__main__':
     # main('AAA',model_name="DARI_densenet_L2", average_number=1000)
     # main('AAA',model_name="DARI_VGG16_L2", average_number=1000)
     # main('AAA',model_name="DARI_ShuffleNet_L2", average_number=1000)
-    # # DARI_mobilenet_L2,TRADES_mnist,ULAT_mnist,Standard_imagenet,robustness_imagenet
+    # mnist + standard imagenet: DARI_mobilenet_L2,TRADES_mnist,ULAT_mnist,Standard_imagenet,robustness_imagenet
     # main('AAA',model_name="DARI_mobilenet_L2", average_number=1000)
     main('AAA',model_name="TRADES_mnist", average_number=1000)
     # main('AAA',model_name="ULAT_mnist", average_number=1000)
     # main('AAA',model_name="Standard_imagenet", average_number=1000)
     # main('AAA',model_name="robustness_imagenet", average_number=1000)
-
-
